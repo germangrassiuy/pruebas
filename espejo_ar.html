@@ -145,6 +145,7 @@
       <div class="btn" data-hover data-barra="pantalla" title="Pantalla completa (F)">⛶</div>
       <div class="btn" data-hover data-barra="girar"    title="Girar la vista 90°">🔃</div>
       <div class="btn" data-hover data-barra="orient"   title="Bloquear orientación">🧭</div>
+      <div class="btn" data-hover data-barra="camara" title="Cambiar de cámara">📷</div>
       <div class="btn" data-hover data-barra="ui" id="bUI" title="Ocultar / mostrar todo (H)">👁</div>
     </div>
 
@@ -163,6 +164,7 @@
       <p>🎨 <b>Fondos</b>: elegí un escenario de mazmorra; el sistema te recorta de la cámara y te mete en la escena.</p>
       <p>🧍 <b>Cualquier .glb / .gltf / .fbx de la carpeta (incluyendo KayKit) sirve</b>: si tiene esqueleto humanoide se ajusta a tu torso, copia tus movimientos y rota si girás o te ponés de espalda; si no, aparece como objeto. 🧍 <i>Modo</i> permite forzar.</p>
       <p>💡 Si un modelo tarda en cargar, podés clickear hasta 3 veces más para cancelarlo y cargar otro. Los .fbx que sean ZIPs renombrados se extraen automáticamente.</p>
+      <label id="elegirCamara" style="display:none;margin:4px 0 8px;font-size:15px">📷 Cámara: <select id="selCamara" style="font-size:15px;padding:4px 6px;border-radius:8px;max-width:260px"></select></label>
       <button type="button" id="btnIniciar">Iniciar cámara</button>
       <div id="error"></div>
     </div>
@@ -1633,6 +1635,7 @@ const BARRA = {
   pantalla: togglearFullscreen,
   girar: () => { rotacion = (rotacion + 90) % 360; layout(); },
   orient: ciclarOrientacion,
+  camara: () => cambiarCamara(),
   ui: toggleUI
 };
 document.querySelectorAll('[data-barra]').forEach(b => {
@@ -2471,17 +2474,77 @@ async function sincronizar(forzar = false) {
 }
 
 /* =====================================================================
+   ELEGIR CÁMARA (si la compu tiene varias)
+   - En la pantalla de inicio: lista "📷 Cámara" (se recuerda).
+     El navegador recién dice los nombres después del primer permiso.
+   - Botón 📷 de la barra: pasa a la siguiente cámara en vivo.
+   ===================================================================== */
+const CLAVE_CAMARA = 'espejo-camara';
+let camaraElegida = '';
+try { camaraElegida = localStorage.getItem(CLAVE_CAMARA) || ''; } catch {}
+function guardarCamara(id) { camaraElegida = id; try { localStorage.setItem(CLAVE_CAMARA, id); } catch {} }
+async function listarCamaras() {
+  try { return (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput' && d.deviceId); }
+  catch { return []; }
+}
+async function llenarSelectorCamaras() {
+  const sel = $('#selCamara');
+  if (!sel) return;
+  const cams = await listarCamaras();
+  sel.innerHTML = '<option value="">Automática</option>' +
+    cams.map((c, i) => `<option value="${c.deviceId}">${(c.label || 'Cámara ' + (i + 1)).replace(/</g, '&lt;')}</option>`).join('');
+  sel.value = cams.some(c => c.deviceId === camaraElegida) ? camaraElegida : '';
+  $('#elegirCamara').style.display = cams.length > 1 ? '' : 'none';
+}
+$('#selCamara')?.addEventListener('change', e => guardarCamara(e.target.value));
+navigator.mediaDevices?.addEventListener?.('devicechange', llenarSelectorCamaras);
+llenarSelectorCamaras();
+
+let cambiandoCamara = false;
+async function cambiarCamara() {
+  if (!iniciado || !video.srcObject || cambiandoCamara) return;   // un toque a la vez
+  cambiandoCamara = true;
+  try { await pasarALaSiguienteCamara(); } finally { cambiandoCamara = false; }
+}
+async function pasarALaSiguienteCamara() {
+  const cams = await listarCamaras();
+  if (cams.length < 2) { setEstado('📷 Hay una sola cámara'); return; }
+  const actual = video.srcObject.getVideoTracks()[0]?.getSettings().deviceId;
+  const i = cams.findIndex(c => c.deviceId === actual);
+  const sig = cams[(i + 1) % cams.length];
+  const nombre = sig.label || ('Cámara ' + (cams.indexOf(sig) + 1));
+  setEstado('📷 Abriendo ' + nombre + '…');
+  try {
+    const nuevo = await navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact: sig.deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+    const viejo = video.srcObject;
+    video.srcObject = nuevo;
+    await video.play();
+    viejo.getTracks().forEach(t => t.stop());
+    await new Promise(r => { if (video.videoWidth) r(); else video.onloadedmetadata = r; });
+    guardarCamara(sig.deviceId);
+    layout();
+    setEstado('📷 ' + nombre);
+  } catch (e) {
+    console.warn('No se pudo cambiar de cámara:', e);
+    setEstado('📷 No se pudo abrir ' + nombre);
+  }
+}
+
+/* =====================================================================
    INICIALIZACIÓN DE CÁMARA E IA
    ===================================================================== */
 async function obtenerStreamCamara() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     throw new Error('Tu navegador no permite acceso a la cámara en este contexto (abrile la página por HTTPS o localhost).');
   }
-  const intentos = [
+  const intentos = [];
+  // la cámara elegida primero; si no está enchufada, sigue con las de siempre
+  if (camaraElegida) intentos.push({ video: { deviceId: { exact: camaraElegida }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+  intentos.push(
     { video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false },
     { video: { facingMode: 'user' }, audio: false },
     { video: true, audio: false }
-  ];
+  );
   let ultimoError = null;
   for (const constraints of intentos) {
     try {
@@ -2507,6 +2570,7 @@ async function iniciar() {
     setEstado('Pidiendo cámara…');
     const stream = await obtenerStreamCamara();
     video.srcObject = stream;
+    llenarSelectorCamaras();
     await video.play();
     await new Promise(r => {
       if (video.videoWidth) r();
